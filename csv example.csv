@@ -1,0 +1,7 @@
+image_id,shape_id,old_text,new_text,dataset_id (optional column)
+2411,339521,Pollen1,pollen,408
+2411,339521,Pollen2,pollen,408
+2411,339521,Pollen3,pollen,408
+9254,339521,Pollen4,pollen,577
+9253,339521,Pollen5,pollen,576
+9253,339521,Pollen6,pollen,576
