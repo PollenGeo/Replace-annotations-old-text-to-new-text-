@@ -12,7 +12,7 @@ def connect_to_omero():
     root = tk.Tk()
     root.withdraw()
 
-    host = simpledialog.askstring("OMERO Login", "Enter OMERO Host:", initialvalue="xxx") #Put your initial host
+    host = simpledialog.askstring("OMERO Login", "Enter OMERO Host:", initialvalue="xxx")#put your initial host
     username = simpledialog.askstring("OMERO Login", "Enter OMERO Username:")
     password = simpledialog.askstring("OMERO Login", "Enter OMERO Password:", show="*")
 
@@ -43,61 +43,88 @@ def connect_to_omero():
     return conn, selected_group_id
 
 
-def select_or_create_dataset(conn, group_id):
+def select_datasets(conn, group_id):
     """
-    Allow the user to select an existing dataset (by ID) or create a new one.
+    Let the user pick one or MORE existing datasets (comma-separated IDs),
+    or type '0' to select ALL datasets in the group.
+    Returns a dict {dataset_id: dataset_wrapper_object}.
     """
     datasets = list(conn.getObjects("Dataset"))
 
     if not datasets:
-        print("No datasets found in this group. A new dataset will be created.")
-        dataset_name = simpledialog.askstring("Create Dataset", "Enter new dataset name:")
-        if not dataset_name:
-            raise ValueError("Dataset name is required.")
+        raise ValueError("No datasets found in this group.")
 
-        dataset = conn.getUpdateService().saveAndReturnObject(
-            conn.getObjectFactory().createDataset(name=dataset_name)
-        )
-        print(f"New Dataset '{dataset_name}' created with ID {dataset.getId()}.")
-        return dataset
-
-    # Display the list of available datasets with their IDs
+    # Build the full list of datasets (no truncation)
     dataset_dict = {d.getId(): d.getName() for d in datasets}
     dataset_options = "\n".join([f"ID: {d_id} - Name: {d_name}" for d_id, d_name in dataset_dict.items()])
 
-    dataset_choice = simpledialog.askinteger(
-        "Select Dataset",
-        f"Available datasets:\n{dataset_options}\n\nEnter Dataset ID or type '0' to create a new one:"
+    choice = simpledialog.askstring(
+        "Select Dataset(s)",
+        f"Available datasets ({len(dataset_dict)}):\n{dataset_options}\n\n"
+        "Enter one or more Dataset IDs separated by commas (e.g. 451,452,455)\n"
+        "or type '0' to select ALL datasets in this group:"
     )
 
-    if dataset_choice == 0:
-        dataset_name = simpledialog.askstring("Create Dataset", "Enter new dataset name:")
-        if not dataset_name:
-            raise ValueError("Dataset name is required.")
+    if choice is None or choice.strip() == "":
+        raise ValueError("No dataset selected.")
 
-        dataset = conn.getUpdateService().saveAndReturnObject(
-            conn.getObjectFactory().createDataset(name=dataset_name)
-        )
-        print(f"New Dataset '{dataset_name}' created with ID {dataset.getId()}.")
-        return dataset
-    elif dataset_choice in dataset_dict:
-        dataset = conn.getObject("Dataset", dataset_choice)
-        print(f"Using existing Dataset '{dataset_dict[dataset_choice]}' (ID: {dataset_choice}).")
-        return dataset
-    else:
-        raise ValueError("Invalid Dataset ID selected.")
+    choice = choice.strip()
+
+    if choice == "0":
+        selected_datasets = {d_id: conn.getObject("Dataset", d_id) for d_id in dataset_dict}
+        print(f"ALL datasets in the group were selected ({len(selected_datasets)} in total).")
+        return selected_datasets
+
+    # Parse comma-separated IDs
+    selected_ids = []
+    for part in choice.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            selected_ids.append(int(part))
+        except ValueError:
+            print(f"'{part}' This is not a valid ID; it is ignored.")
+
+    if not selected_ids:
+        raise ValueError("No valid Dataset IDs provided.")
+
+    selected_datasets = {}
+    for ds_id in selected_ids:
+        if ds_id in dataset_dict:
+            selected_datasets[ds_id] = conn.getObject("Dataset", ds_id)
+            print(f"Selected dataset: '{dataset_dict[ds_id]}' (ID: {ds_id}).")
+        else:
+            print(f"Dataset ID {ds_id} not found in this group, it is ignored.")
+
+    if not selected_datasets:
+        raise ValueError("None of the entered dataset IDs are valid.")
+
+    return selected_datasets
 
 
-def update_comments_from_csv(conn, csv_file, dataset):
+def update_comments_from_csv(conn, csv_file, dataset_map):
     """
     Update shape comments in OMERO based on values from a CSV file.
-    The CSV file must contain the following columns: 'image_id', 'shape_id', 'old_text', and 'new_text'.
+    Required columns: 'image_id', 'shape_id', 'old_text', 'new_text'.
+    Optional column: 'dataset_id' -> which dataset (from dataset_map) to link each image to.
+    If 'dataset_id' is not present and only one dataset was selected, that one is used for all rows.
     """
-    # Load the CSV file
     data = pd.read_csv(csv_file)
     required_columns = {'image_id', 'shape_id', 'old_text', 'new_text'}
     if not required_columns.issubset(data.columns):
         raise ValueError(f"The CSV file must contain the following columns: {required_columns}")
+
+    has_dataset_column = 'dataset_id' in data.columns
+    default_dataset = None
+    if not has_dataset_column:
+        if len(dataset_map) == 1:
+            default_dataset = list(dataset_map.values())[0]
+        else:
+            print(
+                "NOTICE: You selected multiple datasets, but the CSV file does not have a 'dataset_id' column. "
+                "The automatic link from image to dataset will not be created; only the comments will be updated."
+            )
 
     update_service = conn.getUpdateService()
 
@@ -109,16 +136,26 @@ def update_comments_from_csv(conn, csv_file, dataset):
 
         print(f"Processing Image ID={image_id}, Shape ID={shape_id}, Old='{old_comment}', New='{new_comment}'")
 
-        # Retrieve the image
         image = conn.getObject("Image", image_id)
         if not image:
             print(f"Image ID {image_id} not found. Skipping Shape ID {shape_id}.")
             continue
 
-        # Add image to the selected dataset (if not already linked)
-        if image.getParent() is None or image.getParent().getId() != dataset.getId():
-            dataset.linkObject(image)
-            print(f"Image {image_id} linked to Dataset ID {dataset.getId()}.")
+        # Decide which dataset (if any) to link this image to
+        target_dataset = None
+        if has_dataset_column and not pd.isna(row['dataset_id']):
+            row_ds_id = int(row['dataset_id'])
+            target_dataset = dataset_map.get(row_ds_id)
+            if target_dataset is None:
+                print(f"dataset_id {row_ds_id} is not among the selected datasets. The image is not linked.")
+        elif default_dataset is not None:
+            target_dataset = default_dataset
+
+        if target_dataset is not None:
+            parent = image.getParent()
+            if parent is None or parent.getId() != target_dataset.getId():
+                target_dataset.linkImage(image)
+                print(f"Image {image_id} linked to Dataset ID {target_dataset.getId()}.")
 
         # Retrieve the Shape by ID
         shape = None
@@ -134,12 +171,10 @@ def update_comments_from_csv(conn, csv_file, dataset):
             print(f"Shape ID {shape_id} not found in Image ID {image_id}. Skipping...")
             continue
 
-        # Validate the old comment
         if shape.getTextValue().getValue() != old_comment:
             print(f"Shape ID {shape_id} comment does not match '{old_comment}'. Skipping...")
             continue
 
-        # Update the Shape comment
         print(f"Updating Shape ID {shape_id} from '{old_comment}' to '{new_comment}'")
         shape.setTextValue(rstring(new_comment))
         update_service.saveAndReturnObject(shape)
@@ -151,20 +186,20 @@ if __name__ == '__main__':
     root = tk.Tk()
     root.withdraw()  # Hide the main Tkinter window
 
+    conn = None
     try:
         conn, group_id = connect_to_omero()
 
-        # Select or create a dataset using its ID
-        dataset = select_or_create_dataset(conn, group_id)
+        dataset_map = select_datasets(conn, group_id)
 
-        # Show a message about the required CSV structure
         messagebox.showinfo(
             "IMPORTANT",
             "The first row of the CSV file must have the following column titles:\n\n"
-            "image_id, shape_id, old_text, new_text"
+            "image_id, shape_id, old_text, new_text\n\n"
+            "Optional column (if you selected more than one dataset):\n"
+            "dataset_id"
         )
 
-        # Ask the user to select the CSV file
         csv_file = filedialog.askopenfilename(
             title="Select CSV File",
             filetypes=(("CSV Files", "*.csv"), ("All Files", "*.*"))
@@ -173,7 +208,7 @@ if __name__ == '__main__':
         if not csv_file:
             print("No file selected. Exiting.")
         else:
-            update_comments_from_csv(conn, csv_file, dataset)
+            update_comments_from_csv(conn, csv_file, dataset_map)
 
     except Exception as e:
         print(f"An error occurred: {e}")
